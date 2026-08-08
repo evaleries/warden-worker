@@ -67,6 +67,7 @@ There are no immediate plans to implement these features. The primary goal of th
 * **Browser Extensions:** Chrome, Firefox, Safari, etc. (Tested 2026.3.0 on Chrome)
 * **Android App:** The official Bitwarden Android app. (Tested 2026.4.0)
 * **iOS App:** The official Bitwarden iOS app. (Tested 2026.4.0)
+* **CLI:** The official `bw` CLI, including personal API key login (`bw login --apikey`). Retrieve the client id and secret from **Settings → Security → Keys** in the web vault.
 
 ## Demo
 
