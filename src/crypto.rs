@@ -305,6 +305,34 @@ pub async fn validate_totp(
     Err(AppError::Unauthorized("Invalid TOTP code.".to_string()))
 }
 
+/// Generates a 30-character alphanumeric API key (Bitwarden format).
+pub fn generate_api_key() -> Result<String, AppError> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const KEY_LENGTH: usize = 30;
+
+    // Bytes >= 4*62 are discarded; folding them would over-weight `A`..`H`.
+    const REJECT_FROM: u8 = 248;
+    // 4x the usable bytes needed, so a short draw is an error, not a retry.
+    const DRAW_BYTES: u32 = 128;
+
+    let bytes = Uint8Array::new_with_length(DRAW_BYTES);
+    get_crypto()?
+        .get_random_values_with_array_buffer_view(&bytes)
+        .map_err(|e| AppError::Crypto(format!("Failed to generate API key: {:?}", e)))?;
+
+    let key: String = bytes
+        .to_vec()
+        .into_iter()
+        .filter(|&byte| byte < REJECT_FROM)
+        .take(KEY_LENGTH)
+        .map(|byte| ALPHABET[usize::from(byte) % ALPHABET.len()] as char)
+        .collect();
+
+    (key.len() == KEY_LENGTH)
+        .then_some(key)
+        .ok_or_else(|| AppError::Crypto("Failed to generate API key".to_string()))
+}
+
 /// Generates a recovery code (20 characters, Base32 encoded).
 pub fn generate_recovery_code() -> Result<String, AppError> {
     let crypto = get_crypto()?;
