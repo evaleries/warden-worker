@@ -211,6 +211,21 @@ fn optional_field(value: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Applies the shared login rate limiter. A missing binding or a limiter error
+/// lets the request through — the limiter is a safeguard, not an authorization gate.
+async fn enforce_login_rate_limit(env: &Env, key: String) -> Result<(), AppError> {
+    let Ok(rate_limiter) = env.rate_limiter("LOGIN_RATE_LIMITER") else {
+        return Ok(());
+    };
+
+    match rate_limiter.limit(key).await {
+        Ok(outcome) if !outcome.success => Err(AppError::TooManyRequests(
+            "Too many login attempts. Please try again later.".to_string(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn validate_password_scope(value: Option<&str>, required: bool) -> Result<(), AppError> {
     let scope = optional_field(value);
     match scope {
@@ -323,16 +338,23 @@ async fn authenticate_password_grant(
     })
 }
 
-async fn load_user_by_id(db: &crate::db::Db, user_id: &str) -> Result<User, AppError> {
-    let user_value: Option<Value> = db
+async fn find_user_by_id(db: &crate::db::Db, user_id: &str) -> Result<Option<User>, AppError> {
+    let row: Option<Value> = db
         .prepare("SELECT * FROM users WHERE id = ?1")
         .bind(&[user_id.into()])?
         .first(None)
         .await
         .map_err(|_| AppError::Database)?;
 
-    let user_value = user_value.ok_or_else(|| AppError::BadRequest("invalid_grant".to_string()))?;
-    serde_json::from_value(user_value).map_err(|_| AppError::Internal)
+    row.map(|row| serde_json::from_value(row).map_err(|_| AppError::Internal))
+        .transpose()
+}
+
+/// Loads a user for the refresh grant, where a missing row means `invalid_grant`.
+async fn load_user_by_id(db: &crate::db::Db, user_id: &str) -> Result<User, AppError> {
+    find_user_by_id(db, user_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("invalid_grant".to_string()))
 }
 
 async fn maybe_upgrade_password_hash(
@@ -556,17 +578,8 @@ pub async fn token(
         "password" => {
             let username = required_field(payload.username.as_deref(), "username")?;
 
-            // Check rate limit using email as key to prevent brute force attacks.
-            if let Ok(rate_limiter) = env.rate_limiter("LOGIN_RATE_LIMITER") {
-                let rate_limit_key = format!("login:{}", username.to_lowercase());
-                if let Ok(outcome) = rate_limiter.limit(rate_limit_key).await {
-                    if !outcome.success {
-                        return Err(AppError::TooManyRequests(
-                            "Too many login attempts. Please try again later.".to_string(),
-                        ));
-                    }
-                }
-            }
+            // Keyed by email to slow brute force attacks.
+            enforce_login_rate_limit(&env, format!("login:{}", username.to_lowercase())).await?;
 
             let PasswordGrantAuthContext {
                 user,
