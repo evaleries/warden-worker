@@ -16,7 +16,7 @@ use super::{
 };
 use crate::{
     auth::Claims,
-    crypto::{generate_salt, hash_password_for_storage},
+    crypto::{generate_api_key, generate_salt, hash_password_for_storage},
     db,
     error::AppError,
     handlers::{attachments, sends},
@@ -279,6 +279,9 @@ pub async fn register(
         equivalent_domains: "[]".to_string(),
         excluded_globals: "[]".to_string(),
         totp_recover: None,
+        // Minted lazily on the first POST to /api/accounts/api-key, so the INSERT
+        // below deliberately omits the column.
+        api_key: None,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -1108,4 +1111,90 @@ pub async fn post_sstamp(
     notifications::publish_user_logout((*env).clone(), claims.sub, now, None);
 
     Ok(Json(json!({})))
+}
+
+enum ApiKeyAction {
+    View,
+    Rotate,
+}
+
+/// POST /api/accounts/api-key - returns the user's API key, minting one on first use.
+#[worker::send]
+pub async fn api_key(
+    claims: Claims,
+    State(env): State<Arc<Env>>,
+    Json(payload): Json<PasswordOrOtpData>,
+) -> Result<Json<Value>, AppError> {
+    api_key_response(claims, env, payload, ApiKeyAction::View).await
+}
+
+/// POST /api/accounts/rotate-api-key - replaces the user's API key with a fresh one.
+#[worker::send]
+pub async fn rotate_api_key(
+    claims: Claims,
+    State(env): State<Arc<Env>>,
+    Json(payload): Json<PasswordOrOtpData>,
+) -> Result<Json<Value>, AppError> {
+    api_key_response(claims, env, payload, ApiKeyAction::Rotate).await
+}
+
+async fn api_key_response(
+    claims: Claims,
+    env: Arc<Env>,
+    payload: PasswordOrOtpData,
+    action: ApiKeyAction,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&env)?;
+    let user_id = &claims.sub;
+
+    let mut user: User = db
+        .prepare("SELECT * FROM users WHERE id = ?1")
+        .bind(&[user_id.clone().into()])?
+        .first(None)
+        .await
+        .map_err(|_| AppError::Database)?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+    let provided_hash = payload
+        .master_password_hash
+        .ok_or_else(|| AppError::BadRequest("Missing master password hash".to_string()))?;
+
+    let verification = user.verify_master_password(&provided_hash).await?;
+    if !verification.is_valid() {
+        return Err(AppError::BadRequest(
+            "User verification failed.".to_string(),
+        ));
+    }
+
+    if matches!(action, ApiKeyAction::Rotate) || user.stored_api_key().is_none() {
+        let new_key = generate_api_key()?;
+        let now = db::now_string();
+
+        d1_query!(
+            &db,
+            "UPDATE users SET api_key = ?1, updated_at = ?2 WHERE id = ?3",
+            &new_key,
+            &now,
+            user_id
+        )
+        .map_err(|_| AppError::Database)?
+        .run()
+        .await?;
+
+        user.api_key = Some(new_key);
+        user.updated_at = now;
+    }
+
+    Ok(Json(json!({
+        "apiKey": user.api_key,
+        "revisionDate": format_revision_date(&user.updated_at)?,
+        "object": "apiKey",
+    })))
+}
+
+/// Reformats a stored timestamp into the outward-facing shape used by the sync profile.
+fn format_revision_date(stored: &str) -> Result<String, AppError> {
+    Ok(chrono::DateTime::parse_from_rfc3339(stored)
+        .map_err(|_| AppError::Internal)?
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
 }

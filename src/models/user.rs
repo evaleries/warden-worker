@@ -36,6 +36,10 @@ pub struct User {
     #[serde(default = "default_json_array_string")]
     pub excluded_globals: String,
     pub totp_recover: Option<String>, // Recovery code for 2FA
+    /// Personal API key for `client_credentials` login. Plaintext because the view
+    /// endpoint must display it. NULL until first requested.
+    #[serde(default)]
+    pub api_key: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -101,6 +105,18 @@ impl User {
                 PasswordVerification::Mismatch
             })
         }
+    }
+
+    /// The stored API key, treating an empty string as "no key set".
+    pub fn stored_api_key(&self) -> Option<&str> {
+        self.api_key.as_deref().filter(|key| !key.is_empty())
+    }
+
+    /// Constant-time check of a presented `client_secret`. A user who has never
+    /// requested a key cannot authenticate this way.
+    pub fn check_valid_api_key(&self, provided: &str) -> bool {
+        self.stored_api_key()
+            .is_some_and(|key| constant_time_eq(key.as_bytes(), provided.as_bytes()))
     }
 }
 

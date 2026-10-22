@@ -40,6 +40,8 @@ use crate::{
 };
 
 const PASSWORD_SCOPE: &str = "api offline_access";
+/// `api` only — no `offline_access`, hence no refresh token.
+const API_KEY_SCOPE: &str = "api";
 const REMEMBER_TOKEN_ISSUER: &str = "warden-worker-device-remember";
 
 fn login_missing_user_delay_ms(env: &Env) -> u64 {
@@ -92,6 +94,8 @@ pub struct TokenRequest {
     refresh_token: Option<String>,
     #[serde(rename = "client_id", alias = "clientId")]
     client_id: Option<String>,
+    #[serde(rename = "client_secret", alias = "clientSecret")]
+    client_secret: Option<String>,
     send_id: Option<String>,
     password_hash_b64: Option<String>,
     scope: Option<String>,
@@ -145,8 +149,8 @@ pub struct TokenResponse {
     expires_in: i64,
     #[serde(rename = "token_type")]
     token_type: String,
-    #[serde(rename = "refresh_token")]
-    refresh_token: String,
+    #[serde(rename = "refresh_token", skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<String>,
     #[serde(rename = "scope")]
     scope: String,
     #[serde(rename = "Key")]
@@ -188,9 +192,23 @@ enum RefreshAuthMethod {
     Password,
 }
 
-impl RefreshAuthMethod {
+/// How the caller authenticated, which decides the granted scope and whether a
+/// refresh token is issued.
+///
+/// Kept separate from [`RefreshAuthMethod`], which is serialized as `sub` inside
+/// every live refresh JWT and therefore must not gain or lose variants.
+#[derive(Debug, Clone, Copy)]
+enum LoginKind {
+    Password,
+    ApiKey,
+}
+
+impl LoginKind {
     fn scope(self) -> &'static str {
-        PASSWORD_SCOPE
+        match self {
+            LoginKind::Password => PASSWORD_SCOPE,
+            LoginKind::ApiKey => API_KEY_SCOPE,
+        }
     }
 
     fn scope_vec(self) -> Vec<String> {
@@ -198,6 +216,11 @@ impl RefreshAuthMethod {
             .split_whitespace()
             .map(str::to_string)
             .collect()
+    }
+
+    /// API key clients re-run the `client_credentials` grant instead of refreshing.
+    fn issues_refresh_token(self) -> bool {
+        matches!(self, LoginKind::Password)
     }
 }
 
@@ -230,25 +253,54 @@ fn optional_field(value: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn validate_password_scope(value: Option<&str>, required: bool) -> Result<(), AppError> {
+/// Applies the shared login rate limiter, keyed by the caller.
+async fn enforce_login_rate_limit(env: &Env, key: String) -> Result<(), AppError> {
+    enforce_rate_limit(
+        env,
+        "LOGIN_RATE_LIMITER",
+        key,
+        "Too many login attempts. Please try again later.",
+    )
+    .await
+}
+
+/// Splits a `user.<uuid>` client id, as upstream's `UserClientProvider` does.
+/// The UUID is validated so a malformed id never reaches the database.
+fn parse_user_client_id(client_id: &str) -> Option<String> {
+    let user_id = client_id.strip_prefix("user.")?;
+    uuid::Uuid::parse_str(user_id).ok()?;
+    Some(user_id.to_string())
+}
+
+fn validate_scope(value: Option<&str>, expected: &str, required: bool) -> Result<(), AppError> {
     let scope = optional_field(value);
     match scope {
-        Some(scope) if scope == PASSWORD_SCOPE => Ok(()),
+        Some(scope) if scope == expected => Ok(()),
         Some(scope) => Err(AppError::BadRequest(format!("Unsupported scope: {scope}"))),
         None if required => Err(AppError::BadRequest("Missing scope".to_string())),
         None => Ok(()),
     }
 }
 
-fn parse_password_device_request(payload: &TokenRequest) -> Result<DeviceAuthRequest, AppError> {
-    validate_password_scope(payload.scope.as_deref(), true)?;
-
+/// `client_id` is passed in because the `client_credentials` grant has already
+/// parsed and validated its own.
+fn parse_device_request(
+    payload: &TokenRequest,
+    client_id: String,
+) -> Result<DeviceAuthRequest, AppError> {
     Ok(DeviceAuthRequest {
-        client_id: required_field(payload.client_id.as_deref(), "client_id")?,
+        client_id,
         identifier: required_field(payload.device_identifier.as_deref(), "device_identifier")?,
         name: required_field(payload.device_name.as_deref(), "device_name")?,
         r#type: parse_required_device_type(payload.device_type.as_deref(), "device_type")?,
     })
+}
+
+fn parse_password_device_request(payload: &TokenRequest) -> Result<DeviceAuthRequest, AppError> {
+    validate_scope(payload.scope.as_deref(), PASSWORD_SCOPE, true)?;
+
+    let client_id = required_field(payload.client_id.as_deref(), "client_id")?;
+    parse_device_request(payload, client_id)
 }
 
 async fn generate_send_access_token_response(
@@ -294,6 +346,58 @@ async fn generate_send_access_token_response(
         token_type: "Bearer".to_string(),
         scope: "api.send.access".to_string(),
     }))
+}
+
+/// Personal API key login: `client_id=user.<uuid>` plus the key as `client_secret`.
+///
+/// Issues an `api`-scoped access token with no refresh token. 2FA is intentionally
+/// bypassed, matching upstream — the API key is itself the second factor, and a
+/// script has no interactive prompt available.
+async fn api_key_login(
+    env: &Arc<Env>,
+    db: &crate::db::Db,
+    payload: &TokenRequest,
+) -> Result<Json<TokenResponse>, AppError> {
+    let client_id = required_field(payload.client_id.as_deref(), "client_id")?;
+    let client_secret = required_field(payload.client_secret.as_deref(), "client_secret")?;
+    // An absent scope is accepted deliberately: IdentityServer grants a client its
+    // full allowed scope set when a `client_credentials` request omits `scope`.
+    validate_scope(payload.scope.as_deref(), API_KEY_SCOPE, false)?;
+
+    // Every credential failure returns this, so a non-existent user and a wrong
+    // secret are indistinguishable to the caller.
+    let invalid_credentials = || AppError::Unauthorized("Invalid client credentials".to_string());
+
+    let user_id = parse_user_client_id(&client_id).ok_or_else(invalid_credentials)?;
+    enforce_login_rate_limit(env, format!("apikey:{user_id}")).await?;
+
+    let user = find_user_by_id(db, &user_id)
+        .await?
+        .ok_or_else(invalid_credentials)?;
+
+    if !user.check_valid_api_key(&client_secret) {
+        return Err(invalid_credentials());
+    }
+
+    let device_request = parse_device_request(payload, client_id)?;
+    let mut device = Device::get_or_create(
+        db,
+        device_request.identifier,
+        user.id.clone(),
+        device_request.name,
+        device_request.r#type,
+    )
+    .await?;
+    device.touch(db).await?;
+
+    generate_tokens_and_response(
+        user,
+        &device,
+        &device_request.client_id,
+        env,
+        None,
+        LoginKind::ApiKey,
+    )
 }
 
 async fn authenticate_password_grant(
@@ -357,16 +461,23 @@ async fn authenticate_password_grant(
     })
 }
 
-async fn load_user_by_id(db: &crate::db::Db, user_id: &str) -> Result<User, AppError> {
-    let user_value: Option<Value> = db
+async fn find_user_by_id(db: &crate::db::Db, user_id: &str) -> Result<Option<User>, AppError> {
+    let row: Option<Value> = db
         .prepare("SELECT * FROM users WHERE id = ?1")
         .bind(&[user_id.into()])?
         .first(None)
         .await
         .map_err(|_| AppError::Database)?;
 
-    let user_value = user_value.ok_or_else(|| AppError::BadRequest("invalid_grant".to_string()))?;
-    serde_json::from_value(user_value).map_err(|_| AppError::Internal)
+    row.map(|row| serde_json::from_value(row).map_err(|_| AppError::Internal))
+        .transpose()
+}
+
+/// Loads a user for the refresh grant, where a missing row means `invalid_grant`.
+async fn load_user_by_id(db: &crate::db::Db, user_id: &str) -> Result<User, AppError> {
+    find_user_by_id(db, user_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("invalid_grant".to_string()))
 }
 
 async fn maybe_upgrade_password_hash(
@@ -483,11 +594,11 @@ fn generate_tokens_and_response(
     client_id: &str,
     env: &Arc<Env>,
     two_factor_token: Option<String>,
+    login_kind: LoginKind,
 ) -> Result<Json<TokenResponse>, AppError> {
     let now = Utc::now();
     let expires_in = Duration::hours(1);
     let time_options = jwt_time_options();
-    let auth_method = RefreshAuthMethod::Password;
 
     let access_claims = JwtClaims::new(Claims {
         sub: user.id.clone(),
@@ -501,7 +612,7 @@ fn generate_tokens_and_response(
             .display_name()
             .to_string(),
         client_id: client_id.to_string(),
-        scope: auth_method.scope_vec(),
+        scope: login_kind.scope_vec(),
         amr: vec!["Application".into()],
     })
     .set_duration_and_issuance(&time_options, expires_in)
@@ -513,18 +624,24 @@ fn generate_tokens_and_response(
         .token(&Header::empty(), &access_claims, &access_key)
         .map_err(|_| AppError::Crypto("Failed to create access token".to_string()))?;
 
-    let refresh_claims = JwtClaims::new(RefreshClaims {
-        sub: auth_method,
-        device_token: device.refresh_token.clone(),
-        sstamp: user.security_stamp.clone(),
-    })
-    .set_duration_and_issuance(&time_options, Duration::days(30))
-    .set_not_before(now);
-    let jwt_refresh_secret = env.secret("JWT_REFRESH_SECRET")?.to_string();
-    let refresh_key = Hs256Key::new(jwt_refresh_secret.as_bytes());
-    let refresh_token = jwt_compact::alg::Hs256
-        .token(&Header::empty(), &refresh_claims, &refresh_key)
-        .map_err(|_| AppError::Crypto("Failed to create refresh token".to_string()))?;
+    let refresh_token = if login_kind.issues_refresh_token() {
+        let refresh_claims = JwtClaims::new(RefreshClaims {
+            sub: RefreshAuthMethod::Password,
+            device_token: device.refresh_token.clone(),
+            sstamp: user.security_stamp.clone(),
+        })
+        .set_duration_and_issuance(&time_options, Duration::days(30))
+        .set_not_before(now);
+        let jwt_refresh_secret = env.secret("JWT_REFRESH_SECRET")?.to_string();
+        let refresh_key = Hs256Key::new(jwt_refresh_secret.as_bytes());
+        Some(
+            jwt_compact::alg::Hs256
+                .token(&Header::empty(), &refresh_claims, &refresh_key)
+                .map_err(|_| AppError::Crypto("Failed to create refresh token".to_string()))?,
+        )
+    } else {
+        None
+    };
 
     let has_master_password = !user.master_password_hash.is_empty();
     let master_password_unlock = if has_master_password {
@@ -559,7 +676,7 @@ fn generate_tokens_and_response(
         expires_in: expires_in.num_seconds(),
         token_type: "Bearer".to_string(),
         refresh_token,
-        scope: auth_method.scope().to_string(),
+        scope: login_kind.scope().to_string(),
         key: user.key,
         private_key: user.private_key,
         kdf: user.kdf_type,
@@ -590,13 +707,8 @@ pub async fn token(
         "password" => {
             let username = required_field(payload.username.as_deref(), "username")?;
 
-            enforce_rate_limit(
-                env.as_ref(),
-                "LOGIN_RATE_LIMITER",
-                format!("login:{}", username.to_lowercase()),
-                "Too many login attempts. Please try again later.",
-            )
-            .await?;
+            // Keyed by email to slow brute force attacks.
+            enforce_login_rate_limit(&env, format!("login:{}", username.to_lowercase())).await?;
             enforce_ip_rate_limit(
                 env.as_ref(),
                 &headers,
@@ -763,6 +875,7 @@ pub async fn token(
                 &device_request.client_id,
                 &env,
                 two_factor_remember_token,
+                LoginKind::Password,
             )
             .map(IntoResponse::into_response)
         }
@@ -773,7 +886,7 @@ pub async fn token(
             // https://github.com/bitwarden/clients/blob/2ee158e720a5e7dbe3641caf80b569e97a1dd91b/libs/common/src/services/api.service.ts#L1786-L1797
             let refresh_token = required_field(payload.refresh_token.as_deref(), "refresh_token")
                 .map_err(|_| AppError::BadRequest("invalid_grant".to_string()))?;
-            validate_password_scope(payload.scope.as_deref(), false)
+            validate_scope(payload.scope.as_deref(), PASSWORD_SCOPE, false)
                 .map_err(|_| AppError::BadRequest("invalid_grant".to_string()))?;
 
             let jwt_refresh_secret = env.secret("JWT_REFRESH_SECRET")?.to_string();
@@ -811,10 +924,13 @@ pub async fn token(
 
             let client_id = optional_field(payload.client_id.as_deref())
                 .unwrap_or_else(|| "undefined".to_string());
-            generate_tokens_and_response(user, &device, &client_id, &env, None)
+            generate_tokens_and_response(user, &device, &client_id, &env, None, LoginKind::Password)
                 .map(IntoResponse::into_response)
         }
         "send_access" => generate_send_access_token_response(env.as_ref(), &db, &headers, &payload)
+            .await
+            .map(IntoResponse::into_response),
+        "client_credentials" => api_key_login(&env, &db, &payload)
             .await
             .map(IntoResponse::into_response),
         _ => Err(AppError::BadRequest("Unsupported grant_type".to_string())),

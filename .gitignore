@@ -17,3 +17,6 @@ sql/global_domains_seed.sql
 .codex/
 .cursor/
 .claude/
+
+# Generated at deploy time from .env; never committed
+wrangler.generated.toml
