@@ -272,23 +272,12 @@ fn parse_user_client_id(client_id: &str) -> Option<String> {
     Some(user_id.to_string())
 }
 
-fn validate_password_scope(value: Option<&str>, required: bool) -> Result<(), AppError> {
+fn validate_scope(value: Option<&str>, expected: &str, required: bool) -> Result<(), AppError> {
     let scope = optional_field(value);
     match scope {
-        Some(scope) if scope == PASSWORD_SCOPE => Ok(()),
+        Some(scope) if scope == expected => Ok(()),
         Some(scope) => Err(AppError::BadRequest(format!("Unsupported scope: {scope}"))),
         None if required => Err(AppError::BadRequest("Missing scope".to_string())),
-        None => Ok(()),
-    }
-}
-
-/// An absent scope is accepted deliberately: IdentityServer grants a client its full
-/// allowed scope set when a `client_credentials` request omits `scope`, so rejecting
-/// would be stricter than upstream and could break a client relying on that default.
-fn validate_api_key_scope(value: Option<&str>) -> Result<(), AppError> {
-    match optional_field(value) {
-        Some(scope) if scope == API_KEY_SCOPE => Ok(()),
-        Some(scope) => Err(AppError::BadRequest(format!("Unsupported scope: {scope}"))),
         None => Ok(()),
     }
 }
@@ -308,7 +297,7 @@ fn parse_device_request(
 }
 
 fn parse_password_device_request(payload: &TokenRequest) -> Result<DeviceAuthRequest, AppError> {
-    validate_password_scope(payload.scope.as_deref(), true)?;
+    validate_scope(payload.scope.as_deref(), PASSWORD_SCOPE, true)?;
 
     let client_id = required_field(payload.client_id.as_deref(), "client_id")?;
     parse_device_request(payload, client_id)
@@ -371,7 +360,9 @@ async fn api_key_login(
 ) -> Result<Json<TokenResponse>, AppError> {
     let client_id = required_field(payload.client_id.as_deref(), "client_id")?;
     let client_secret = required_field(payload.client_secret.as_deref(), "client_secret")?;
-    validate_api_key_scope(payload.scope.as_deref())?;
+    // An absent scope is accepted deliberately: IdentityServer grants a client its
+    // full allowed scope set when a `client_credentials` request omits `scope`.
+    validate_scope(payload.scope.as_deref(), API_KEY_SCOPE, false)?;
 
     // Every credential failure returns this, so a non-existent user and a wrong
     // secret are indistinguishable to the caller.
@@ -895,7 +886,7 @@ pub async fn token(
             // https://github.com/bitwarden/clients/blob/2ee158e720a5e7dbe3641caf80b569e97a1dd91b/libs/common/src/services/api.service.ts#L1786-L1797
             let refresh_token = required_field(payload.refresh_token.as_deref(), "refresh_token")
                 .map_err(|_| AppError::BadRequest("invalid_grant".to_string()))?;
-            validate_password_scope(payload.scope.as_deref(), false)
+            validate_scope(payload.scope.as_deref(), PASSWORD_SCOPE, false)
                 .map_err(|_| AppError::BadRequest("invalid_grant".to_string()))?;
 
             let jwt_refresh_secret = env.secret("JWT_REFRESH_SECRET")?.to_string();

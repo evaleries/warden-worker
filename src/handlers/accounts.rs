@@ -1166,8 +1166,6 @@ async fn api_key_response(
         ));
     }
 
-    let mut revision_date = user.updated_at.clone();
-
     if matches!(action, ApiKeyAction::Rotate) || user.stored_api_key().is_none() {
         let new_key = generate_api_key()?;
         let now = db::now_string();
@@ -1184,12 +1182,12 @@ async fn api_key_response(
         .await?;
 
         user.api_key = Some(new_key);
-        revision_date = now;
+        user.updated_at = now;
     }
 
     Ok(Json(json!({
         "apiKey": user.api_key,
-        "revisionDate": format_revision_date(&revision_date)?,
+        "revisionDate": format_revision_date(&user.updated_at)?,
         "object": "apiKey",
     })))
 }
