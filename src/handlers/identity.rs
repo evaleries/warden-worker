@@ -11,7 +11,8 @@ use jwt_compact::{alg::Hs256Key, Claims as JwtClaims, Header, UntrustedToken};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
-use worker::Env;
+use std::time::Duration as StdDuration;
+use worker::{Delay, Env};
 
 use crate::d1_query;
 use crate::{
@@ -25,7 +26,7 @@ use crate::{
     db,
     error::AppError,
     handlers::{
-        allow_totp_drift, server_password_iterations,
+        allow_totp_drift, enforce_ip_rate_limit, enforce_rate_limit, server_password_iterations,
         twofactor::{is_twofactor_enabled, list_user_twofactors},
     },
     models::{
@@ -42,6 +43,24 @@ const PASSWORD_SCOPE: &str = "api offline_access";
 /// `api` only — no `offline_access`, hence no refresh token.
 const API_KEY_SCOPE: &str = "api";
 const REMEMBER_TOKEN_ISSUER: &str = "warden-worker-device-remember";
+
+fn login_missing_user_delay_ms(env: &Env) -> u64 {
+    const JITTER_MS: i32 = 30;
+    const DEFAULT_LOGIN_MISSING_USER_DELAY_MS: i32 = 550;
+    let base_ms = env
+        .var("LOGIN_MISSING_USER_DELAY_MS")
+        .ok()
+        .and_then(|value| value.to_string().parse::<i32>().ok())
+        .unwrap_or(DEFAULT_LOGIN_MISSING_USER_DELAY_MS);
+
+    let mut random_byte = [0u8; 1];
+    let jitter_ms = if getrandom::fill(&mut random_byte).is_ok() {
+        (i32::from(random_byte[0]) * (JITTER_MS * 2 + 1) / 256) - JITTER_MS
+    } else {
+        0
+    };
+    (base_ms + jitter_ms).max(0) as u64
+}
 
 /// Deserialize an Option<i32> that may have trailing/leading whitespace.
 /// This handles Android clients that send "0 " instead of "0".
@@ -234,19 +253,15 @@ fn optional_field(value: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Applies the shared login rate limiter. A missing binding or a limiter error
-/// lets the request through — the limiter is a safeguard, not an authorization gate.
+/// Applies the shared login rate limiter, keyed by the caller.
 async fn enforce_login_rate_limit(env: &Env, key: String) -> Result<(), AppError> {
-    let Ok(rate_limiter) = env.rate_limiter("LOGIN_RATE_LIMITER") else {
-        return Ok(());
-    };
-
-    match rate_limiter.limit(key).await {
-        Ok(outcome) if !outcome.success => Err(AppError::TooManyRequests(
-            "Too many login attempts. Please try again later.".to_string(),
-        )),
-        _ => Ok(()),
-    }
+    enforce_rate_limit(
+        env,
+        "LOGIN_RATE_LIMITER",
+        key,
+        "Too many login attempts. Please try again later.",
+    )
+    .await
 }
 
 /// Splits a `user.<uuid>` client id, as upstream's `UserClientProvider` does.
@@ -302,6 +317,7 @@ fn parse_password_device_request(payload: &TokenRequest) -> Result<DeviceAuthReq
 async fn generate_send_access_token_response(
     env: &Env,
     db: &crate::db::Db,
+    headers: &HeaderMap,
     payload: &TokenRequest,
 ) -> Result<Json<SendAccessTokenResponse>, AppError> {
     let _client_id = required_field(payload.client_id.as_deref(), "client_id")?;
@@ -315,6 +331,15 @@ async fn generate_send_access_token_response(
     }
 
     if send.has_password() {
+        enforce_ip_rate_limit(
+            env,
+            headers,
+            "SEND_ACCESS_RATE_LIMITER",
+            "send-access",
+            "Too many send password attempts. Please try again later.",
+        )
+        .await?;
+
         let password_hash_b64 =
             required_field(payload.password_hash_b64.as_deref(), "password_hash_b64")
                 .map_err(|_| AppError::send_access_password_required())?;
@@ -385,6 +410,7 @@ async fn api_key_login(
 }
 
 async fn authenticate_password_grant(
+    env: &Env,
     db: &crate::db::Db,
     headers: &HeaderMap,
     payload: &TokenRequest,
@@ -392,9 +418,13 @@ async fn authenticate_password_grant(
 ) -> Result<PasswordGrantAuthContext, AppError> {
     let password_hash = required_field(payload.password.as_deref(), "password")?;
     let device_request = parse_password_device_request(payload)?;
-    let user = User::find_by_email(db, &username.to_lowercase())
-        .await?
-        .ok_or_else(|| AppError::Unauthorized("Invalid credentials".to_string()))?;
+    let user = match User::find_by_email(db, &username.to_lowercase()).await? {
+        Some(user) => user,
+        None => {
+            Delay::from(StdDuration::from_millis(login_missing_user_delay_ms(env))).await;
+            return Err(AppError::Unauthorized("Invalid credentials".to_string()));
+        }
+    };
 
     // Bitwarden "login with device" flow:
     // When `authrequest` is present, clients send the auth-request access code in the `password`
@@ -688,13 +718,22 @@ pub async fn token(
 
             // Keyed by email to slow brute force attacks.
             enforce_login_rate_limit(&env, format!("login:{}", username.to_lowercase())).await?;
+            enforce_ip_rate_limit(
+                env.as_ref(),
+                &headers,
+                "LOGIN_RATE_LIMITER",
+                "login-ip",
+                "Too many login attempts. Please try again later.",
+            )
+            .await?;
 
             let PasswordGrantAuthContext {
                 user,
                 device_request,
                 password_hash,
                 needs_migration,
-            } = authenticate_password_grant(&db, &headers, &payload, &username).await?;
+            } = authenticate_password_grant(env.as_ref(), &db, &headers, &payload, &username)
+                .await?;
 
             let mut device = Device::get_or_create(
                 &db,
@@ -897,7 +936,7 @@ pub async fn token(
             generate_tokens_and_response(user, &device, &client_id, &env, None, LoginKind::Password)
                 .map(IntoResponse::into_response)
         }
-        "send_access" => generate_send_access_token_response(env.as_ref(), &db, &payload)
+        "send_access" => generate_send_access_token_response(env.as_ref(), &db, &headers, &payload)
             .await
             .map(IntoResponse::into_response),
         "client_credentials" => api_key_login(&env, &db, &payload)
